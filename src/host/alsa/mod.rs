@@ -14,7 +14,7 @@ use crate::{
 };
 use std::cmp;
 use std::convert::TryInto;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::vec::IntoIter as VecIntoIter;
@@ -295,6 +295,8 @@ impl Device {
             conf: conf.clone(),
             period_len,
             can_pause,
+			pause: std::sync::Mutex::new(false),
+			pause_condvar: Condvar::new(),
             creation_instant,
         };
 
@@ -528,6 +530,9 @@ struct StreamInner {
     // TODO: We need an API to expose this. See #197, #284.
     can_pause: bool,
 
+	pause: std::sync::Mutex<bool>,
+	pause_condvar: Condvar,
+
     // In the case that the device does not return valid timestamps via `get_htstamp`, this field
     // will be `Some` and will contain an `Instant` representing the moment the stream was created.
     //
@@ -591,6 +596,14 @@ fn input_stream_worker(
 ) {
     let mut ctxt = StreamWorkerContext::new(&timeout);
     loop {
+		// If paused, sleep until unpaused.
+		{
+			let mut pause = stream.pause.lock().unwrap();
+			while *pause {
+				pause = stream.pause_condvar.wait(pause).unwrap();
+			}
+		}
+
         let flow =
             poll_descriptors_and_prepare_buffer(&rx, stream, &mut ctxt).unwrap_or_else(|err| {
                 error_callback(err.into());
@@ -642,6 +655,14 @@ fn output_stream_worker(
 ) {
     let mut ctxt = StreamWorkerContext::new(&timeout);
     loop {
+		// If paused, sleep until unpaused.
+		{
+			let mut pause = stream.pause.lock().unwrap();
+			while *pause {
+				pause = stream.pause_condvar.wait(pause).unwrap();
+			}
+		}
+
         let flow =
             poll_descriptors_and_prepare_buffer(&rx, stream, &mut ctxt).unwrap_or_else(|err| {
                 error_callback(err.into());
@@ -989,10 +1010,14 @@ impl Drop for Stream {
 impl StreamTrait for Stream {
     fn play(&self) -> Result<(), PlayStreamError> {
         self.inner.channel.pause(false).ok();
+		*self.inner.pause.lock().unwrap() = false;
+		self.inner.pause_condvar.notify_all();
         Ok(())
     }
     fn pause(&self) -> Result<(), PauseStreamError> {
         self.inner.channel.pause(true).ok();
+		*self.inner.pause.lock().unwrap() = true;
+		self.inner.pause_condvar.notify_all();
         Ok(())
     }
 }
